@@ -23,6 +23,12 @@ class VerdictEnum(str, Enum):
     CONFLICTING_EVIDENCE = "CONFLICTING_EVIDENCE"
 
 
+class VerificationIssue(str, Enum):
+    RETRIEVAL_UNAVAILABLE = "RETRIEVAL_UNAVAILABLE"
+    INFERENCE_UNAVAILABLE = "INFERENCE_UNAVAILABLE"
+    INVALID_MODEL_OUTPUT = "INVALID_MODEL_OUTPUT"
+
+
 class EvidenceChunk(BaseModel):
     text: EvidenceText
     source_doc: NonBlank
@@ -60,6 +66,7 @@ class VerificationResult(BaseModel):
     confidence: float = Field(ge=0, le=1)
     citation_ids: list[str] = Field(default_factory=list)
     rationale: str
+    issue: VerificationIssue | None = None
     frozen_ir_hash: str | None = None
     frozen_ir: tuple[FrozenFact, ...] = ()
 
@@ -67,6 +74,7 @@ class VerificationResult(BaseModel):
 class AuditVerdict(BaseModel):
     overall_status: VerdictEnum
     verified_claims: list[VerificationResult] = Field(default_factory=list)
+    assertion_verification: VerificationResult | None = None
     aggregated_confidence: float = Field(ge=0, le=1)
     requires_hitl: bool = False
     audit_summary: str
@@ -82,6 +90,7 @@ class AgentState(BaseModel):
     claims: list[Claim] = Field(default_factory=list)
     current_claim_index: int = 0
     retrieved_evidence: dict[str, list[EvidenceItem]] = Field(default_factory=dict)
+    failed_retrievals: list[str] = Field(default_factory=list)
     verifications: list[VerificationResult] = Field(default_factory=list)
     requires_human_review: bool = False
     audit_verdict: AuditVerdict | None = None

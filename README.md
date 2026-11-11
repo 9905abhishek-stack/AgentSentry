@@ -8,7 +8,8 @@ AgentSentry audits factual, compliance, and security assertions against document
 2. The service uses the supplied evidence chunks or queries Qdrant for dense BGE-small and sparse BM25 matches. It combines the corpus rankings with reciprocal rank fusion using `k=60` by default.
 3. A first model call extracts factual tuples with source IDs and verbatim quotes. AgentSentry checks each quote against its source, sorts and deduplicates the tuples, and hashes their canonical JSON using SHA-256. Each tuple includes a hash of its source text.
 4. A separate model call decides the verdict from the claim and frozen tuples. In strict mode this call receives only the claim and frozen facts. Setting `strict_evidence_lock` to `false` also provides the original evidence to the decision call. Both modes validate the cited IDs.
-5. The audit reports `SUPPORTED`, `REFUTED`, `CONFLICTING_EVIDENCE`, or `INSUFFICIENT_EVIDENCE`. Any uncertain claim or per-claim confidence below the configured threshold flags the audit for human review. The flag is part of the response for the caller to act on.
+5. If the plan splits or rewrites the assertion, the supervisor makes a separate decision on the original wording using the combined frozen facts. The response includes this decision as `assertion_verification`, with its own citations and hash.
+6. The audit reports `SUPPORTED`, `REFUTED`, `CONFLICTING_EVIDENCE`, or `INSUFFICIENT_EVIDENCE`. Uncertainty or confidence below the configured threshold flags the audit for human review. A verification result's `issue` field identifies retrieval failures, inference failures, or invalid model output when one occurred.
 
 The model supplies the confidence scores and interprets the text. The hashes let a reviewer check the frozen representation and source contents. Semantic correctness, model calibration, and resistance to instructions embedded in documents remain model-dependent. Use corpora and request evidence you are authorized to send to the configured inference service.
 
@@ -46,7 +47,7 @@ $env:QDRANT_HOST = 'localhost'
 python -m app.index_corpus evidence.jsonl
 ```
 
-The indexer creates a compatible collection if needed and upserts by source and chunk number. FastEmbed downloads the dense and sparse model assets on first use. For a replacement snapshot, index into a fresh collection and point the API at it. When updating a collection in place, change `CORPUS_REVISION` on the API after indexing to invalidate cached verdicts.
+The indexer validates the full file and rejects duplicate source and chunk pairs before writing to Qdrant. It creates a compatible collection if needed and upserts by source and chunk number. FastEmbed downloads the dense and sparse model assets on first use. If a backend failure interrupts indexing, rerun the same file to complete the upserts. To publish a replacement snapshot, index into a fresh collection and point the API at it after the upload succeeds. When updating a collection in place, change `CORPUS_REVISION` on the API after indexing to invalidate cached verdicts.
 
 `docker compose up --build -d` runs the API, Qdrant, and Redis. Index from the host against `localhost:6333`. Compose stores Qdrant data in the `qdrant_data` volume. If you used the earlier Compose file with `qdrant_storage/`, reindex your source chunks into the new volume. When the inference service runs on the Docker Desktop host, set `VLLM_API_BASE=http://host.docker.internal:8001/v1` for Compose and provide the served model ID. The API and Qdrant host ports bind to loopback. For a browser frontend on another origin, set `CORS_ORIGINS` to a JSON list of allowed origins. Deployments serving other users need an authenticated gateway and appropriate corpus access controls.
 
@@ -57,7 +58,7 @@ The indexer creates a compatible collection if needed and upserts by source and 
 | `POST /api/v1/audit` | Complete audit response with evidence and per-claim citations |
 | `POST /api/v1/audit/stream` | Server-sent events with `start`, `node_complete`, and `done` with the full audit result, or `error` |
 | `GET /api/v1/metrics` | Process-local counts, cache hits, human-review flags, and average completed-audit latency |
-| `GET /health` | Status of the configured Redis, Qdrant collection, and inference model |
+| `GET /health` | Status of the configured Redis, Qdrant collection and vector compatibility, and inference model |
 
 Both audit routes accept the same JSON:
 
@@ -81,7 +82,7 @@ python -m pytest
 python -m evaluation.run_ragas_eval
 ```
 
-The evaluation command requires a configured vLLM model. It reports verdict accuracy on four labeled fixtures, the fraction of paired verdicts that change when the same evidence is reversed, and mean verification latency. This is a small verifier benchmark. The fixture results do not measure corpus retrieval precision, RAGAS faithfulness, or production latency.
+The evaluation command requires a configured vLLM model. It reports verdict accuracy on four labeled fixtures, the fraction of paired verdicts that change when the same evidence is reversed, and mean latency across attempted verifications. It reports failed attempts separately and excludes them from accuracy and stability. Each rate is null when it has no usable observations. This is a fixture benchmark for the verifier.
 
 ## License
 

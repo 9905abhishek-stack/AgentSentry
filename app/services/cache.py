@@ -24,12 +24,15 @@ class CacheService:
 
     def init(self) -> None:
         if settings.redis_url and self._redis is None:
-            self._redis = Redis.from_url(
-                settings.redis_url,
-                decode_responses=True,
-                socket_connect_timeout=1.0,
-                socket_timeout=1.0,
-            )
+            try:
+                self._redis = Redis.from_url(
+                    settings.redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=1.0,
+                    socket_timeout=1.0,
+                )
+            except ValueError:
+                logger.warning("Redis configuration is invalid. Using the local cache.")
 
     @staticmethod
     def key(query: str, strict: bool) -> str:
@@ -44,16 +47,18 @@ class CacheService:
             settings.vllm_api_base,
             settings.vllm_model,
             settings.llm_max_tokens,
+            settings.max_verification_retries,
             settings.confidence_threshold,
         ]
         digest = hashlib.sha256(json.dumps(components).encode("utf-8")).hexdigest()
-        return f"agentsentry:audit:v2:{digest}"
+        return f"agentsentry:audit:v3:{digest}"
 
     async def get(self, key: str) -> AuditResponse | None:
         if self._redis is not None:
             try:
                 value = await asyncio.wait_for(self._redis.get(key), timeout=1.5)
-                return AuditResponse.model_validate_json(value) if value else None
+                if value is not None:
+                    return AuditResponse.model_validate_json(value)
             except (RedisError, OSError, TimeoutError, ValidationError):
                 logger.warning("Redis cache lookup failed. Checking the local cache.")
 
@@ -85,7 +90,7 @@ class CacheService:
 
     async def health(self) -> str:
         if self._redis is None:
-            return "disabled"
+            return "unavailable" if settings.redis_url else "disabled"
         try:
             if await asyncio.wait_for(self._redis.ping(), timeout=1.5):
                 return "available"

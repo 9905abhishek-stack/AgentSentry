@@ -44,7 +44,7 @@ class VLLMClient:
             choice = response.json()["choices"][0]
             content = choice["message"]["content"]
             if (
-                choice.get("finish_reason") == "length"
+                choice.get("finish_reason") not in (None, "stop")
                 or not isinstance(content, str)
                 or not content.strip()
             ):

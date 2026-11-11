@@ -62,8 +62,11 @@ FIXTURES = (
 @dataclass(frozen=True)
 class EvalMetrics:
     fixture_count: int
-    verdict_accuracy: float
-    evidence_order_flip_rate: float
+    evaluated_baselines: int
+    evaluated_order_pairs: int
+    failed_attempts: int
+    verdict_accuracy: float | None
+    evidence_order_flip_rate: float | None
     average_verification_latency_ms: float
 
 
@@ -72,7 +75,7 @@ async def run_evaluation() -> EvalMetrics:
         raise RuntimeError(
             "Configure VLLM_API_BASE and VLLM_MODEL to run the evaluation."
         )
-    correct = flips = 0
+    correct = flips = baselines = pairs = failures = 0
     elapsed = 0.0
     for fixture in FIXTURES:
         claim = Claim(claim_id="c1", text=fixture.claim)
@@ -84,12 +87,23 @@ async def run_evaluation() -> EvalMetrics:
         baseline = await verify_claim(claim, evidence, strict=True)
         reordered = await verify_claim(claim, list(reversed(evidence)), strict=True)
         elapsed += time.perf_counter() - started
-        correct += baseline.verdict == fixture.expected
-        flips += baseline.verdict != reordered.verdict
+        failures += int(baseline.issue is not None) + int(reordered.issue is not None)
+        if baseline.issue is None:
+            baselines += 1
+            correct += baseline.verdict == fixture.expected
+        if baseline.issue is None and reordered.issue is None:
+            pairs += 1
+            flips += baseline.verdict != reordered.verdict
 
     count = len(FIXTURES)
     return EvalMetrics(
-        count, correct / count, flips / count, elapsed * 1000 / (2 * count)
+        fixture_count=count,
+        evaluated_baselines=baselines,
+        evaluated_order_pairs=pairs,
+        failed_attempts=failures,
+        verdict_accuracy=correct / baselines if baselines else None,
+        evidence_order_flip_rate=flips / pairs if pairs else None,
+        average_verification_latency_ms=elapsed * 1000 / (2 * count),
     )
 
 
@@ -108,6 +122,8 @@ def main() -> None:
     except RuntimeError as exc:
         parser.exit(1, f"{exc}\n")
     print(json.dumps(asdict(results), indent=2))
+    if not results.evaluated_baselines:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

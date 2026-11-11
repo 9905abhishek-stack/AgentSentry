@@ -113,6 +113,7 @@ def search_corpus(text: str) -> list[EvidenceItem]:
 async def retrieve_evidence(state: AgentState) -> dict[str, Any]:
     claim = state.claims[state.current_claim_index]
     review = state.requires_human_review
+    failures = state.failed_retrievals
     evidence = []
     if state.context_documents is not None:
         evidence = [
@@ -130,11 +131,13 @@ async def retrieve_evidence(state: AgentState) -> dict[str, Any]:
             logger.warning("Corpus retrieval failed (%s)", type(exc).__name__)
             message = "Corpus retrieval failed. Human review required."
             review = True
+            failures = [*failures, claim.claim_id]
     else:
         message = "No evidence corpus configured."
 
     return {
         "retrieved_evidence": {**state.retrieved_evidence, claim.claim_id: evidence},
         "requires_human_review": review,
+        "failed_retrievals": failures,
         "execution_log": [*state.execution_log, message],
     }

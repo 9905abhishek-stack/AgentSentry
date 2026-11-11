@@ -2,21 +2,34 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Iterator
+from contextlib import closing
 from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from qdrant_client import QdrantClient, models
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from app import main
 from app.config import settings
 from app.graph.nodes import retriever, verifier
 from app.graph.nodes.planner import order_claims
-from app.schemas.agent_state import AuditResponse, Claim, EvidenceItem
+from app.schemas.agent_state import (
+    AuditResponse,
+    Claim,
+    EvidenceChunk,
+    EvidenceItem,
+    VerdictEnum,
+    VerificationIssue,
+    VerificationResult,
+)
 from app.services import cache as cache_module
 from app.services.cache import CacheService
-from app.services.vllm_client import VLLMClient, vllm_service
+from app.services.corpus import DENSE_SIZE, DENSE_VECTOR, SPARSE_VECTOR, index_chunks
+from app.services.vllm_client import InferenceUnavailable, VLLMClient, vllm_service
+from evaluation import run_ragas_eval
 
 QUERY = "Production logs are retained for 30 days."
 EVIDENCE = "Production logs are retained for 30 days under the retention policy."
@@ -49,7 +62,7 @@ def install_model(
     monkeypatch: pytest.MonkeyPatch,
     *,
     extraction: list[dict[str, str]] | None = None,
-    citation: str = "context-1",
+    citation: str | list[str] = "context-1",
     decision: str = "SUPPORTED",
     confidence: float = 0.97,
     plan: list[dict[str, Any]] | None = None,
@@ -79,7 +92,7 @@ def install_model(
             {
                 "verdict": decision,
                 "confidence": confidence,
-                "citation_ids": [citation],
+                "citation_ids": [citation] if isinstance(citation, str) else citation,
                 "rationale": "The decision follows the supplied facts.",
             }
         )
@@ -215,7 +228,71 @@ def test_graph_respects_dependencies_and_flags_uncertainty(
     results = result["verdict"]["verified_claims"]
     assert [item["claim_id"] for item in results] == ["first", "second"]
     assert [item["verdict"] for item in results] == ["REFUTED", "INSUFFICIENT_EVIDENCE"]
-    assert [stage for stage, _ in calls] == ["plan", "extract", "decide"]
+    assert [stage for stage, _ in calls] == ["plan", "extract", "decide", "decide"]
+
+
+def test_duplicate_passages_do_not_establish_conflicting_evidence(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_model(
+        monkeypatch,
+        extraction=[fact("context-1"), fact("context-2")],
+        citation=["context-1", "context-2"],
+        decision="CONFLICTING_EVIDENCE",
+    )
+    result = client.post(
+        "/api/v1/audit",
+        json={"query": QUERY, "context_documents": [EVIDENCE, EVIDENCE]},
+    ).json()
+    assert result["status"] == "INSUFFICIENT_EVIDENCE"
+    assert result["verdict"]["verified_claims"][0]["issue"] == "INVALID_MODEL_OUTPUT"
+
+
+@pytest.mark.parametrize(
+    ("operator", "expected"),
+    [("or", "SUPPORTED"), ("and", "INSUFFICIENT_EVIDENCE")],
+)
+def test_overall_verdict_uses_original_assertion(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, operator: str, expected: str
+) -> None:
+    first = QUERY
+    second = "Production logs are retained for 90 days."
+    original = (
+        "Production logs are retained for 30 days or 90 days."
+        if operator == "or"
+        else "Production logs are retained for 30 days and encrypted at rest."
+    )
+
+    async def generate(messages: list[dict[str, str]]) -> str:
+        prompt, user = (item["content"] for item in messages)
+        if prompt.startswith("Decompose"):
+            planned = [{"claim_id": "first", "text": first}]
+            if operator == "or":
+                planned.append({"claim_id": "second", "text": second})
+            return json.dumps({"claims": planned})
+        payload = json.loads(user)
+        if prompt.startswith(verifier.EXTRACTION_PROMPT):
+            return json.dumps({"facts": [fact()]})
+        assert prompt.startswith(verifier.DECISION_PROMPT)
+        outcome = {first: "SUPPORTED", second: "REFUTED", original: expected}
+        return json.dumps(
+            {
+                "verdict": outcome[payload["claim"]],
+                "confidence": 0.97,
+                "citation_ids": ["context-1"],
+                "rationale": "Decided against the quoted retention policy.",
+            }
+        )
+
+    monkeypatch.setattr(vllm_service, "generate", generate)
+    result = client.post(
+        "/api/v1/audit", json={"query": original, "context_documents": [EVIDENCE]}
+    ).json()
+    assert result["status"] == expected
+    assertion = result["verdict"]["assertion_verification"]
+    assert assertion["claim_text"] == original
+    assert assertion["frozen_ir_hash"]
+    assert result["verdict"]["requires_hitl"] is (operator == "and")
 
 
 def test_maximum_claim_plan_completes(
@@ -334,6 +411,133 @@ def test_local_cache_expiry_capacity_and_copy(
     asyncio.run(exercise())
 
 
+def test_redis_miss_can_use_fallback_after_recovery(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    response = AuditResponse.model_validate(
+        client.post("/api/v1/audit", json={"query": QUERY}).json()
+    )
+    cache = CacheService()
+
+    async def disconnected(*_args: Any, **_kwargs: Any) -> None:
+        raise RedisConnectionError("unavailable")
+
+    async def redis_get(_key: str) -> str | None:
+        return None
+
+    monkeypatch.setattr(
+        cache, "_redis", SimpleNamespace(get=redis_get, set=disconnected)
+    )
+
+    async def exercise() -> None:
+        await cache.set("fallback", response)
+        assert await cache.get("fallback") == response
+
+    asyncio.run(exercise())
+
+
+def test_indexer_validates_later_rows_before_writing() -> None:
+    with closing(QdrantClient(":memory:")) as client:
+
+        def invalid_rows() -> Iterator[EvidenceChunk]:
+            for index in range(32):
+                yield EvidenceChunk(
+                    source_doc="policy.txt", chunk_id=index, text=EVIDENCE
+                )
+            raise ValueError("Invalid evidence chunk on line 33.")
+
+        with pytest.raises(ValueError, match="line 33"):
+            index_chunks(client, "test", invalid_rows())
+        assert not client.collection_exists("test")
+
+        chunk = EvidenceChunk(source_doc="policy.txt", chunk_id=1, text=EVIDENCE)
+        with pytest.raises(ValueError, match="Duplicate source and chunk ID"):
+            index_chunks(client, "test", [chunk, chunk])
+        assert not client.collection_exists("test")
+
+
+def test_indexer_rejects_unconfirmed_qdrant_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with closing(QdrantClient(":memory:")) as client:
+        client.create_collection(
+            "test",
+            vectors_config={
+                DENSE_VECTOR: models.VectorParams(
+                    size=DENSE_SIZE, distance=models.Distance.COSINE
+                )
+            },
+            sparse_vectors_config={
+                SPARSE_VECTOR: models.SparseVectorParams(modifier=models.Modifier.IDF)
+            },
+        )
+        monkeypatch.setattr(
+            client,
+            "upsert",
+            lambda **_: models.UpdateResult(status=models.UpdateStatus.WAIT_TIMEOUT),
+        )
+        chunk = EvidenceChunk(source_doc="policy.txt", chunk_id=1, text=EVIDENCE)
+        with pytest.raises(RuntimeError, match="after 0 confirmed chunk"):
+            index_chunks(client, "test", [chunk])
+
+
+def test_health_reports_incompatible_corpus(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    qdrant = QdrantClient(":memory:")
+    qdrant.create_collection(
+        settings.qdrant_collection,
+        vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE),
+    )
+    monkeypatch.setattr(settings, "qdrant_host", "configured.test")
+    monkeypatch.setattr(main, "connect_corpus", lambda: qdrant)
+    health = client.get("/health").json()
+    assert health["status"] == "degraded"
+    assert health["subsystems"]["qdrant"] == "incompatible_collection"
+
+
+def test_evaluation_excludes_failed_inference_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def health() -> str:
+        return "available"
+
+    attempts = iter(
+        [
+            (
+                VerdictEnum.INSUFFICIENT_EVIDENCE,
+                VerificationIssue.INFERENCE_UNAVAILABLE,
+            ),
+            (VerdictEnum.INSUFFICIENT_EVIDENCE, None),
+            (VerdictEnum.REFUTED, None),
+            (VerdictEnum.SUPPORTED, None),
+        ]
+    )
+
+    async def verify(
+        claim: Claim, _evidence: list[EvidenceItem], strict: bool
+    ) -> VerificationResult:
+        assert strict
+        verdict, issue = next(attempts)
+        return VerificationResult(
+            claim_id=claim.claim_id,
+            claim_text=claim.text,
+            verdict=verdict,
+            confidence=0.9,
+            rationale="fixture",
+            issue=issue,
+        )
+
+    monkeypatch.setattr(vllm_service, "health", health)
+    monkeypatch.setattr(run_ragas_eval, "verify_claim", verify)
+    fixtures = run_ragas_eval.FIXTURES
+    monkeypatch.setattr(run_ragas_eval, "FIXTURES", (fixtures[2], fixtures[1]))
+    results = asyncio.run(run_ragas_eval.run_evaluation())
+    assert results.failed_attempts == 1
+    assert results.evaluated_baselines == results.evaluated_order_pairs == 1
+    assert results.verdict_accuracy == results.evidence_order_flip_rate == 1
+
+
 def test_vllm_preserves_api_base_and_checks_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -358,3 +562,26 @@ def test_vllm_preserves_api_base_and_checks_model(
 
     asyncio.run(exercise())
     assert paths == ["/prefix/v1/models", "/prefix/v1/chat/completions"]
+
+
+def test_vllm_rejects_content_filtered_completions() -> None:
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"finish_reason": "content_filter", "message": {"content": "{}"}}
+                ]
+            },
+        )
+
+    async def exercise() -> None:
+        service = VLLMClient(base_url="http://vllm.test/v1", model="served")
+        async with httpx.AsyncClient(
+            base_url="http://vllm.test/v1/", transport=httpx.MockTransport(handle)
+        ) as client:
+            service._client = client
+            with pytest.raises(InferenceUnavailable):
+                await service.generate([{"role": "user", "content": QUERY}])
+
+    asyncio.run(exercise())

@@ -20,7 +20,7 @@ from app.graph.nodes.retriever import close_corpus
 from app.graph.workflow import audit_dag
 from app.schemas.agent_state import AgentState, AuditResponse, QueryRequest
 from app.services.cache import cache_service
-from app.services.corpus import connect_corpus
+from app.services.corpus import compatible_collection, connect_corpus
 from app.services.vllm_client import vllm_service
 
 logging.basicConfig(
@@ -80,10 +80,14 @@ def corpus_health() -> str:
     try:
         client = connect_corpus()
         try:
+            collection = settings.qdrant_collection
+            if not client.collection_exists(collection):
+                return "missing_collection"
+            params = client.get_collection(collection).config.params
             return (
                 "available"
-                if client.collection_exists(settings.qdrant_collection)
-                else "missing_collection"
+                if compatible_collection(params)
+                else "incompatible_collection"
             )
         finally:
             client.close()
