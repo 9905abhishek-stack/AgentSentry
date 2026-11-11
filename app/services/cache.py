@@ -1,87 +1,103 @@
-"""
-Semantic & Exact Redis Cache for AgentSentry
-Caches verified audit verdicts to achieve sub-15ms response times for repeat/similar queries.
-Includes automatic fallback to in-memory LRU cache if Redis container is not active.
-"""
+"""TTL cache for completed corpus audits, with a bounded local fallback."""
+
+import asyncio
 import hashlib
 import json
 import logging
-from typing import Optional
+import time
+from collections import OrderedDict
+
+from pydantic import ValidationError
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
+
 from app.config import settings
-from app.schemas.agent_state import AuditVerdict
+from app.schemas.agent_state import AuditResponse
 
-logger = logging.getLogger("agentsentry.cache")
-
-try:
-    import redis.asyncio as aioredis
-    REDIS_AVAILABLE = True
-except ImportError:
-    REDIS_AVAILABLE = False
+logger = logging.getLogger(__name__)
 
 
 class CacheService:
-    def __init__(self):
-        self.redis_client = None
-        self._memory_cache = {}
-        self._initialized = False
+    def __init__(self) -> None:
+        self._redis: Redis | None = None
+        self._memory: OrderedDict[str, tuple[float, str]] = OrderedDict()
 
-    async def init(self):
-        if not self._initialized and REDIS_AVAILABLE:
+    def init(self) -> None:
+        if settings.redis_url and self._redis is None:
+            self._redis = Redis.from_url(
+                settings.redis_url,
+                decode_responses=True,
+                socket_connect_timeout=1.0,
+                socket_timeout=1.0,
+            )
+
+    @staticmethod
+    def key(query: str, strict: bool) -> str:
+        components = [
+            query,
+            strict,
+            settings.qdrant_host,
+            settings.qdrant_port,
+            settings.qdrant_collection,
+            settings.corpus_revision,
+            settings.hybrid_rrf_k,
+            settings.vllm_api_base,
+            settings.vllm_model,
+            settings.llm_max_tokens,
+            settings.confidence_threshold,
+        ]
+        digest = hashlib.sha256(json.dumps(components).encode("utf-8")).hexdigest()
+        return f"agentsentry:audit:v2:{digest}"
+
+    async def get(self, key: str) -> AuditResponse | None:
+        if self._redis is not None:
             try:
-                self.redis_client = aioredis.from_url(
-                    settings.redis_url,
-                    encoding="utf-8",
-                    decode_responses=True,
-                    socket_connect_timeout=1.5
-                )
-                await self.redis_client.ping()
-                logger.info("Successfully connected to Redis semantic cache.")
-            except Exception as e:
-                logger.warning(f"Redis unavailable ({e}). Falling back to in-memory cache.")
-                self.redis_client = None
-            self._initialized = True
+                value = await asyncio.wait_for(self._redis.get(key), timeout=1.5)
+                return AuditResponse.model_validate_json(value) if value else None
+            except (RedisError, OSError, TimeoutError, ValidationError):
+                logger.warning("Redis cache lookup failed. Checking the local cache.")
 
-    def _normalize_key(self, query: str) -> str:
-        clean = query.strip().lower()
-        key_hash = hashlib.sha256(clean.encode("utf-8")).hexdigest()
-        return f"agentsentry:verdict:{key_hash}"
+        cached = self._memory.get(key)
+        if cached is None:
+            return None
+        expires, value = cached
+        if expires <= time.monotonic():
+            self._memory.pop(key, None)
+            return None
+        self._memory.move_to_end(key)
+        return AuditResponse.model_validate_json(value)
 
-    async def get(self, query: str) -> Optional[AuditVerdict]:
-        await self.init()
-        key = self._normalize_key(query)
-
-        if self.redis_client:
+    async def set(self, key: str, response: AuditResponse) -> None:
+        value = response.model_dump_json()
+        ttl = settings.cache_ttl_seconds
+        if self._redis is not None:
             try:
-                val = await self.redis_client.get(key)
-                if val:
-                    return AuditVerdict.model_validate_json(val)
-            except Exception as e:
-                logger.warning(f"Redis get failed: {e}")
+                await asyncio.wait_for(self._redis.set(key, value, ex=ttl), timeout=1.5)
+                self._memory.pop(key, None)
+                return
+            except (RedisError, OSError, TimeoutError):
+                logger.warning("Redis cache write failed. Using the local cache.")
 
-        # In-memory check
-        if key in self._memory_cache:
-            return self._memory_cache[key]
-        return None
+        self._memory[key] = (time.monotonic() + ttl, value)
+        self._memory.move_to_end(key)
+        while len(self._memory) > settings.cache_max_entries:
+            self._memory.popitem(last=False)
 
-    async def set(self, query: str, verdict: AuditVerdict, ttl_seconds: Optional[int] = None):
-        await self.init()
-        key = self._normalize_key(query)
-        ttl = ttl_seconds or settings.cache_ttl_seconds
+    async def health(self) -> str:
+        if self._redis is None:
+            return "disabled"
+        try:
+            if await asyncio.wait_for(self._redis.ping(), timeout=1.5):
+                return "available"
+        except (RedisError, OSError, TimeoutError):
+            pass
+        return "unavailable"
 
-        serialized = verdict.model_dump_json()
-
-        if self.redis_client:
-            try:
-                await self.redis_client.set(key, serialized, ex=ttl)
-            except Exception as e:
-                logger.warning(f"Redis set failed: {e}")
-
-        # Keep in memory as well
-        self._memory_cache[key] = verdict
-
-    async def close(self):
-        if self.redis_client:
-            await self.redis_client.aclose()
+    async def close(self) -> None:
+        if self._redis is not None:
+            await self._redis.aclose()
+            self._redis = None
+        self._memory.clear()
 
 
 cache_service = CacheService()

@@ -1,4 +1,4 @@
-from .vllm_client import vllm_service, VLLMClient
-from .cache import cache_service, CacheService
+from .cache import CacheService, cache_service
+from .vllm_client import VLLMClient, vllm_service
 
-__all__ = ["vllm_service", "VLLMClient", "cache_service", "CacheService"]
+__all__ = ["CacheService", "VLLMClient", "cache_service", "vllm_service"]

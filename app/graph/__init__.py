@@ -1,3 +1,3 @@
-from .workflow import build_audit_graph, audit_dag
+from .workflow import audit_dag, build_audit_graph
 
-__all__ = ["build_audit_graph", "audit_dag"]
+__all__ = ["audit_dag", "build_audit_graph"]

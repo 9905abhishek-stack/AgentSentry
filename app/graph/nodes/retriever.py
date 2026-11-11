@@ -1,107 +1,140 @@
-"""
-LangGraph DAG Node: Hybrid Retriever
-Performs dense embedding + sparse BM25 retrieval with Reciprocal Rank Fusion (RRF).
-Targeting Qdrant vector database with graceful fallback.
-"""
+"""Retrieve evidence from request documents or the configured Qdrant corpus."""
+
+import asyncio
 import hashlib
 import logging
-from typing import List, Dict
-from app.config import settings
-from app.schemas.agent_state import AgentState, EvidenceItem, Claim
+from threading import Lock
+from typing import Any
 
-logger = logging.getLogger("agentsentry.retriever")
+from qdrant_client import QdrantClient, models
+from qdrant_client.http.exceptions import ApiException
+
+from app.config import settings
+from app.schemas.agent_state import (
+    MAX_CONTEXT_CHUNKS,
+    AgentState,
+    EvidenceChunk,
+    EvidenceItem,
+)
+from app.services.corpus import (
+    DENSE_MODEL,
+    DENSE_VECTOR,
+    SPARSE_MODEL,
+    SPARSE_VECTOR,
+    connect_corpus,
+)
+
+logger = logging.getLogger(__name__)
+_corpus_client: QdrantClient | None = None
+_corpus_lock = Lock()
+
+
+def close_corpus() -> None:
+    global _corpus_client
+    with _corpus_lock:
+        if _corpus_client is not None:
+            _corpus_client.close()
+            _corpus_client = None
 
 
 def compute_rrf(
-    dense_items: List[EvidenceItem],
-    sparse_items: List[EvidenceItem],
-    k: int = 60
-) -> List[EvidenceItem]:
-    """
-    Computes Reciprocal Rank Fusion (RRF) scores across dense and sparse ranked lists.
-    RRF_Score(doc) = 1/(k + rank_dense) + 1/(k + rank_sparse)
-    """
-    scores: Dict[str, float] = {}
-    doc_map: Dict[str, EvidenceItem] = {}
-
-    # Rank dense
-    for rank, item in enumerate(dense_items):
-        scores[item.id] = scores.get(item.id, 0.0) + (1.0 / (k + rank + 1))
-        doc_map[item.id] = item
-
-    # Rank sparse
-    for rank, item in enumerate(sparse_items):
-        scores[item.id] = scores.get(item.id, 0.0) + (1.0 / (k + rank + 1))
-        if item.id not in doc_map:
-            doc_map[item.id] = item
-
-    # Assign fused scores and sort descending
-    fused_results = []
-    for doc_id, final_score in sorted(scores.items(), key=lambda x: x[1], reverse=True):
-        doc = doc_map[doc_id]
-        doc.fused_rrf_score = round(final_score, 5)
-        fused_results.append(doc)
-
-    return fused_results
-
-
-async def retrieve_evidence(state: AgentState) -> AgentState:
-    """
-    Retrieves grounding evidence for the current atomic claim.
-    """
-    if not state.claims or state.current_claim_index >= len(state.claims):
-        return state
-
-    current_claim: Claim = state.claims[state.current_claim_index]
-    logger.info(f"Retrieving hybrid evidence for claim [{current_claim.claim_id}]: '{current_claim.text}'")
-
-    # In a live deployment, this queries Qdrant with dense BGE-M3 vectors and BM25 payload indexes.
-    # Here we demonstrate both the client integration and deterministic RRF ranking:
-    query_seed = hashlib.md5(current_claim.text.encode()).hexdigest()[:6]
-
-    # Synthesized realistic evidence items for testing & verification
-    dense_candidates = [
-        EvidenceItem(
-            id=f"chunk_{query_seed}_1",
-            text=f"Official Audit Record Section 4.2: Confirms '{current_claim.text}' with verified cryptographic hash.",
-            source_doc="soc2_type2_audit_2024.pdf",
-            chunk_id=42,
-            dense_score=0.91,
-            sparse_score=0.65
-        ),
-        EvidenceItem(
-            id=f"chunk_{query_seed}_2",
-            text=f"System Architecture Appendix: Architectural specs matching claim parameters for {current_claim.category}.",
-            source_doc="architecture_spec_v3.pdf",
-            chunk_id=12,
-            dense_score=0.83,
-            sparse_score=0.78
+    dense_items: list[EvidenceItem],
+    sparse_items: list[EvidenceItem],
+    k: int = 60,
+) -> list[EvidenceItem]:
+    scores: dict[str, float] = {}
+    items: dict[str, EvidenceItem] = {}
+    for ranked, score_field in (
+        (dense_items, "dense_score"),
+        (sparse_items, "sparse_score"),
+    ):
+        seen = set()
+        for rank, item in enumerate(ranked, 1):
+            if item.id in seen:
+                continue
+            seen.add(item.id)
+            scores[item.id] = scores.get(item.id, 0.0) + 1 / (k + rank)
+            previous = items.get(item.id, item)
+            items[item.id] = previous.model_copy(
+                update={score_field: getattr(item, score_field)}
+            )
+    return [
+        items[point_id].model_copy(update={"fused_rrf_score": scores[point_id]})
+        for point_id in sorted(
+            scores, key=lambda point_id: (-scores[point_id], point_id)
         )
     ]
 
-    sparse_candidates = [
-        EvidenceItem(
-            id=f"chunk_{query_seed}_2",
-            text=f"System Architecture Appendix: Architectural specs matching claim parameters for {current_claim.category}.",
-            source_doc="architecture_spec_v3.pdf",
-            chunk_id=12,
-            dense_score=0.83,
-            sparse_score=0.78
-        ),
-        EvidenceItem(
-            id=f"chunk_{query_seed}_1",
-            text=f"Official Audit Record Section 4.2: Confirms '{current_claim.text}' with verified cryptographic hash.",
-            source_doc="soc2_type2_audit_2024.pdf",
-            chunk_id=42,
-            dense_score=0.91,
-            sparse_score=0.65
+
+def search_corpus(text: str) -> list[EvidenceItem]:
+    global _corpus_client
+    requests = [
+        models.QueryRequest(
+            query=models.Document(text=text, model=model),
+            using=vector,
+            limit=MAX_CONTEXT_CHUNKS,
+            with_payload=True,
+        )
+        for vector, model in (
+            (DENSE_VECTOR, DENSE_MODEL),
+            (SPARSE_VECTOR, SPARSE_MODEL),
         )
     ]
+    # The client lazily loads its embedding models on first use.
+    with _corpus_lock:
+        if _corpus_client is None:
+            _corpus_client = connect_corpus()
+        dense, sparse = _corpus_client.query_batch_points(
+            settings.qdrant_collection, requests
+        )
 
-    fused = compute_rrf(dense_candidates, sparse_candidates, k=settings.hybrid_rrf_k)
-    state.retrieved_evidence[current_claim.claim_id] = fused
+    def to_evidence(
+        points: list[models.ScoredPoint], score_field: str
+    ) -> list[EvidenceItem]:
+        results = []
+        for point in points:
+            chunk = EvidenceChunk.model_validate(point.payload)
+            revision = hashlib.sha256(chunk.text.encode("utf-8")).hexdigest()
+            payload = {
+                **chunk.model_dump(),
+                "id": f"{point.id}:{revision}",
+                score_field: point.score,
+            }
+            results.append(EvidenceItem.model_validate(payload))
+        return results
 
-    state.execution_log.append(
-        f"[Retriever] Retrieved & fused {len(fused)} evidence chunks for claim [{current_claim.claim_id}] (Top RRF: {fused[0].fused_rrf_score if fused else 0.0})"
-    )
-    return state
+    return compute_rrf(
+        to_evidence(dense.points, "dense_score"),
+        to_evidence(sparse.points, "sparse_score"),
+        k=settings.hybrid_rrf_k,
+    )[:MAX_CONTEXT_CHUNKS]
+
+
+async def retrieve_evidence(state: AgentState) -> dict[str, Any]:
+    claim = state.claims[state.current_claim_index]
+    review = state.requires_human_review
+    evidence = []
+    if state.context_documents is not None:
+        evidence = [
+            EvidenceItem(
+                id=f"context-{index}", source_doc="request", chunk_id=index, text=text
+            )
+            for index, text in enumerate(state.context_documents, 1)
+        ]
+        message = f"Loaded {len(evidence)} request evidence chunk(s)."
+    elif settings.qdrant_host:
+        try:
+            evidence = await asyncio.to_thread(search_corpus, claim.text)
+            message = f"Retrieved {len(evidence)} evidence chunk(s) from the corpus."
+        except (ApiException, OSError, ValueError, RuntimeError) as exc:
+            logger.warning("Corpus retrieval failed (%s)", type(exc).__name__)
+            message = "Corpus retrieval failed. Human review required."
+            review = True
+    else:
+        message = "No evidence corpus configured."
+
+    return {
+        "retrieved_evidence": {**state.retrieved_evidence, claim.claim_id: evidence},
+        "requires_human_review": review,
+        "execution_log": [*state.execution_log, message],
+    }

@@ -1,62 +1,35 @@
-"""
-LangGraph Multi-Agent StateGraph Workflow
-Defines the directed acyclic graph (DAG), node edges, and conditional routing logic.
-"""
-import logging
-from langgraph.graph import StateGraph, END
-from app.schemas.agent_state import AgentState
+"""Compile the LangGraph workflow shared by REST, streaming, and evaluation."""
+
+from typing import Literal
+
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+
 from app.graph.nodes.planner import plan_and_decompose
 from app.graph.nodes.retriever import retrieve_evidence
-from app.graph.nodes.verifier import verify_evidence_locked
 from app.graph.nodes.supervisor import supervise_and_synthesize
+from app.graph.nodes.verifier import verify_evidence_locked
+from app.schemas.agent_state import AgentState
 
-logger = logging.getLogger("agentsentry.workflow")
 
-
-def should_continue_verifying(state: AgentState) -> str:
-    """
-    Conditional routing function:
-    Determines if more sub-claims need retrieval & verification or if we proceed to supervision.
-    """
+def next_node(state: AgentState) -> Literal["retriever", "supervisor"]:
     if state.current_claim_index < len(state.claims):
         return "retriever"
     return "supervisor"
 
 
-def build_audit_graph():
-    """
-    Constructs and compiles the AgentSentry LangGraph DAG.
-    """
+def build_audit_graph() -> CompiledStateGraph[AgentState, None, AgentState, AgentState]:
     workflow = StateGraph(AgentState)
-
-    # 1. Register Nodes
     workflow.add_node("planner", plan_and_decompose)
     workflow.add_node("retriever", retrieve_evidence)
     workflow.add_node("verifier", verify_evidence_locked)
     workflow.add_node("supervisor", supervise_and_synthesize)
-
-    # 2. Register Edges
-    workflow.set_entry_point("planner")
-    workflow.add_edge("planner", "retriever")
+    workflow.add_edge(START, "planner")
+    workflow.add_conditional_edges("planner", next_node)
     workflow.add_edge("retriever", "verifier")
-
-    # 3. Conditional verification loop for multi-claim DAG
-    workflow.add_conditional_edges(
-        "verifier",
-        should_continue_verifying,
-        {
-            "retriever": "retriever",
-            "supervisor": "supervisor"
-        }
-    )
-
-    # 4. Supervisor terminates into END
+    workflow.add_conditional_edges("verifier", next_node)
     workflow.add_edge("supervisor", END)
-
-    # Compile the graph
-    app = workflow.compile()
-    return app
+    return workflow.compile()
 
 
-# Pre-compiled application instance
 audit_dag = build_audit_graph()

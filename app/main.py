@@ -1,190 +1,239 @@
-"""
-AgentSentry FastAPI Production Service
-Exposes REST and SSE Streaming endpoints for real-time evidence-locked AI audits.
-"""
-import time
+"""FastAPI routes for executing and observing audits."""
+
+import asyncio
 import json
 import logging
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+import time
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing, asynccontextmanager
+from dataclasses import dataclass
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from qdrant_client.http.exceptions import ApiException
 
+from app import __version__
 from app.config import settings
-from app.schemas.agent_state import (
-    QueryRequest,
-    AuditResponse,
-    AgentState,
-    VerdictEnum
-)
-from app.services.cache import cache_service
-from app.services.vllm_client import vllm_service
+from app.graph.nodes.retriever import close_corpus
 from app.graph.workflow import audit_dag
+from app.schemas.agent_state import AgentState, AuditResponse, QueryRequest
+from app.services.cache import cache_service
+from app.services.corpus import connect_corpus
+from app.services.vllm_client import vllm_service
 
-# Setup logging
 logging.basicConfig(
-    level=logging.INFO if not settings.debug else logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    level=logging.DEBUG if settings.debug else logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("agentsentry.api")
+logger = logging.getLogger(__name__)
 
-# In-memory operational metrics
-METRICS = {
-    "total_audits": 0,
-    "cache_hits": 0,
-    "escalated_hitl": 0,
-    "total_latency_ms": 0.0
-}
+
+@dataclass
+class AuditMetrics:
+    total_audits: int = 0
+    cache_hits: int = 0
+    hitl_escalations: int = 0
+    total_latency_ms: float = 0.0
+
+    def record(self, response: AuditResponse) -> None:
+        self.total_audits += 1
+        self.cache_hits += int(response.cache_hit)
+        self.hitl_escalations += int(response.verdict.requires_hitl)
+        self.total_latency_ms += response.latency_ms
+
+
+metrics = AuditMetrics()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Initializing AgentSentry audit engine...")
-    await cache_service.init()
-    yield
-    logger.info("Shutting down AgentSentry services...")
-    await cache_service.close()
-    await vllm_service.close()
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    cache_service.init()
+    try:
+        yield
+    finally:
+        await asyncio.gather(
+            cache_service.close(), vllm_service.close(), asyncio.to_thread(close_corpus)
+        )
 
 
 app = FastAPI(
     title="AgentSentry API",
-    description="Enterprise Evidence-Locked Multi-Agent Audit System",
-    version="0.1.0",
-    lifespan=lifespan
+    description="Evidence-grounded claim auditing",
+    version=__version__,
+    lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if settings.cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
 
-@app.get("/health", status_code=status.HTTP_200_OK, tags=["System"])
-async def health_check():
-    """Returns the operational status of AgentSentry subsystems."""
+def corpus_health() -> str:
+    if not settings.qdrant_host:
+        return "disabled"
+    try:
+        client = connect_corpus()
+        try:
+            return (
+                "available"
+                if client.collection_exists(settings.qdrant_collection)
+                else "missing_collection"
+            )
+        finally:
+            client.close()
+    except (ApiException, OSError, ValueError, RuntimeError):
+        return "unavailable"
+
+
+@app.get("/health", tags=["System"])
+async def health_check() -> dict[str, Any]:
+    corpus, redis, inference = await asyncio.gather(
+        asyncio.to_thread(corpus_health), cache_service.health(), vllm_service.health()
+    )
+    subsystems = {"qdrant": corpus, "redis": redis, "vllm": inference}
     return {
-        "status": "healthy",
+        "status": "healthy"
+        if set(subsystems.values()) <= {"available", "disabled"}
+        else "degraded",
         "app": settings.app_name,
         "environment": settings.app_env,
-        "vllm_endpoint": settings.vllm_api_base,
-        "qdrant_host": settings.qdrant_host,
         "evidence_locked_strict": settings.evidence_locked_strict,
+        "subsystems": subsystems,
     }
 
 
 @app.get("/api/v1/metrics", tags=["Observability"])
-async def get_metrics():
-    """Returns real-time SLA and latency metrics."""
-    total = max(METRICS["total_audits"], 1)
+async def get_metrics() -> dict[str, int | float]:
+    denominator = max(metrics.total_audits, 1)
     return {
-        "total_audits": METRICS["total_audits"],
-        "cache_hits": METRICS["cache_hits"],
-        "cache_hit_rate": round(METRICS["cache_hits"] / total, 3),
-        "hitl_escalation_count": METRICS["escalated_hitl"],
-        "average_latency_ms": round(METRICS["total_latency_ms"] / total, 2),
+        "total_audits": metrics.total_audits,
+        "cache_hits": metrics.cache_hits,
+        "cache_hit_rate": round(metrics.cache_hits / denominator, 3),
+        "hitl_escalation_count": metrics.hitl_escalations,
+        "average_latency_ms": round(metrics.total_latency_ms / denominator, 2),
     }
 
 
-@app.post("/api/v1/audit", response_model=AuditResponse, tags=["Audit"])
-async def execute_audit(request: QueryRequest):
-    """
-    Executes an evidence-locked audit through the LangGraph StateGraph DAG.
-    1. Checks Redis semantic cache.
-    2. Decomposes query into atomic claims.
-    3. Executes dense + sparse hybrid retrieval with RRF.
-    4. Evaluates evidence against the Frozen Intermediate Representation (FIR).
-    5. Computes confidence and escalates to HITL if below SLA.
-    """
-    start_time = time.perf_counter()
-    METRICS["total_audits"] += 1
+async def run_audit(
+    request: QueryRequest,
+) -> AsyncGenerator[dict[str, str] | AuditResponse, None]:
+    started = time.perf_counter()
+    strict = (
+        settings.evidence_locked_strict
+        if request.strict_evidence_lock is None
+        else request.strict_evidence_lock
+    )
+    key = None
+    response = None
+    if (
+        request.context_documents is None
+        and settings.qdrant_host
+        and vllm_service.base_url
+    ):
+        key = cache_service.key(request.query, strict)
+        response = await cache_service.get(key)
 
-    # 1. Cache Check
-    cached_verdict = await cache_service.get(request.query)
-    if cached_verdict:
-        METRICS["cache_hits"] += 1
-        elapsed = (time.perf_counter() - start_time) * 1000.0
-        cached_verdict.total_latency_ms = round(elapsed, 2)
-        return AuditResponse(
+    if response is None:
+        initial = AgentState(
             query=request.query,
-            status=cached_verdict.overall_status,
-            verdict=cached_verdict,
-            evidence_items=[],
-            latency_ms=round(elapsed, 2),
-            cache_hit=True
+            strict_evidence_lock=strict,
+            context_documents=request.context_documents,
         )
+        final = None
+        async for mode, output in audit_dag.astream(
+            initial, stream_mode=["updates", "values"]
+        ):
+            if mode == "values":
+                final = output
+            elif mode == "updates" and isinstance(output, dict):
+                for node, update in output.items():
+                    yield {
+                        "event": "node_complete",
+                        "node": node,
+                        "latest_log": update["execution_log"][-1],
+                    }
 
-    # 2. Initialize StateGraph
-    initial_state = AgentState(query=request.query)
+        state = AgentState.model_validate(final)
+        verdict = state.audit_verdict
+        if verdict is None:
+            raise RuntimeError("Audit workflow completed without a verdict.")
+        evidence = {
+            item.id: item
+            for items in state.retrieved_evidence.values()
+            for item in items
+        }
+        response = AuditResponse(
+            query=request.query,
+            status=verdict.overall_status,
+            verdict=verdict,
+            evidence_items=list(evidence.values()),
+            latency_ms=0.0,
+        )
+    else:
+        response.cache_hit = True
 
+    response.latency_ms = round((time.perf_counter() - started) * 1000, 2)
+    response.verdict.total_latency_ms = response.latency_ms
+    if (
+        key is not None
+        and not response.cache_hit
+        and not response.verdict.requires_hitl
+    ):
+        await cache_service.set(key, response)
+    metrics.record(response)
+    yield response
+
+
+@app.post("/api/v1/audit", response_model=AuditResponse, tags=["Audit"])
+async def execute_audit(request: QueryRequest) -> AuditResponse:
     try:
-        # Run asynchronous DAG
-        raw_state = await audit_dag.ainvoke(initial_state)
-        final_state: AgentState = AgentState(**raw_state) if isinstance(raw_state, dict) else raw_state
-    except Exception as e:
-        logger.error(f"Error during audit DAG execution: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Audit graph execution failed: {str(e)}"
-        )
-
-    elapsed = (time.perf_counter() - start_time) * 1000.0
-    METRICS["total_latency_ms"] += elapsed
-
-    verdict = final_state.audit_verdict
-    if verdict:
-        verdict.total_latency_ms = round(elapsed, 2)
-        if verdict.requires_hitl:
-            METRICS["escalated_hitl"] += 1
-
-        # Cache high-confidence verdicts
-        if not verdict.requires_hitl:
-            await cache_service.set(request.query, verdict)
-
-    # Collect all flattened evidence citations
-    all_evidence = []
-    for claim_ev in final_state.retrieved_evidence.values():
-        all_evidence.extend(claim_ev)
-
-    return AuditResponse(
-        query=request.query,
-        status=verdict.overall_status if verdict else VerdictEnum.INSUFFICIENT_EVIDENCE,
-        verdict=verdict,
-        evidence_items=all_evidence,
-        latency_ms=round(elapsed, 2),
-        cache_hit=False
+        async with aclosing(run_audit(request)) as audit:
+            async for item in audit:
+                if isinstance(item, AuditResponse):
+                    return item
+    except Exception as exc:
+        logger.exception("Audit workflow failed.")
+        raise HTTPException(status_code=500, detail="Audit workflow failed.") from exc
+    raise HTTPException(
+        status_code=500, detail="Audit workflow did not return a result."
     )
 
 
 @app.post("/api/v1/audit/stream", tags=["Audit"])
-async def stream_audit(request: QueryRequest):
-    """
-    Server-Sent Events (SSE) streaming endpoint:
-    Streams step-by-step audit progress as each node in the LangGraph DAG completes.
-    """
-    async def event_generator() -> AsyncGenerator[str, None]:
-        initial_state = AgentState(query=request.query)
-        yield f"data: {json.dumps({'event': 'start', 'query': request.query})}\n\n"
+async def stream_audit(request: QueryRequest) -> StreamingResponse:
+    async def events() -> AsyncIterator[str]:
+        yield sse({"event": "start", "query": request.query})
+        try:
+            async with aclosing(run_audit(request)) as audit:
+                async for item in audit:
+                    if isinstance(item, AuditResponse):
+                        yield sse(
+                            {"event": "done", "result": item.model_dump(mode="json")}
+                        )
+                    else:
+                        yield sse(item)
+        except Exception:
+            logger.exception("Streaming audit workflow failed.")
+            yield sse({"event": "error", "message": "Audit workflow failed."})
 
-        async for output in audit_dag.astream(initial_state):
-            for node_name, state_update in output.items():
-                payload = {
-                    "event": "node_complete",
-                    "node": node_name,
-                    "latest_log": state_update.execution_log[-1] if state_update.execution_log else ""
-                }
-                yield f"data: {json.dumps(payload)}\n\n"
+    return StreamingResponse(
+        events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
+    )
 
-        yield f"data: {json.dumps({'event': 'done'})}\n\n"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+def sse(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+
+    uvicorn.run(
+        "app.main:app", host=settings.host, port=settings.port, reload=settings.debug
+    )

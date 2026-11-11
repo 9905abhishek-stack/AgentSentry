@@ -1,226 +1,88 @@
-# AgentSentry: Enterprise Evidence-Locked Multi-Agent Audit System
+# AgentSentry
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph%20DAG-orange.svg)](https://github.com/langchain-ai/langgraph)
-[![Vector Store](https://img.shields.io/badge/Vector%20DB-Qdrant%20Hybrid%20RRF-red.svg)](https://qdrant.tech/)
-[![Inference Engine](https://img.shields.io/badge/Inference-vLLM%20PagedAttention-green.svg)](https://github.com/vllm-project/vllm)
-[![Evaluation](https://img.shields.io/badge/Evaluation-RAGAS%20%2B%20FIR-purple.svg)](https://github.com/explodinggradients/ragas)
+AgentSentry audits factual, compliance, and security assertions against document evidence. The FastAPI service returns a verdict, per-claim reasoning, source citations, and a human-review flag. It accepts evidence with a request or retrieves it from an indexed Qdrant corpus.
 
-AgentSentry is an enterprise-grade multi-agent audit and verification system designed to evaluate complex compliance policies, security assertions, and factual claims against large document corpora without semantic drift or hallucination.
+## Audit workflow
 
-It introduces the **Evidence-Locked Frozen Intermediate Representation (FIR)** protocol—guaranteeing that LLM/SLM verifiers reason strictly from cryptographically anchored factual representations, eliminating verdict flips and ungrounded extrapolation.
+1. A vLLM model decomposes an assertion into up to ten claims. LangGraph verifies them in dependency order. A claim whose prerequisite is uncertain also requires review.
+2. The service uses the supplied evidence chunks or queries Qdrant for dense BGE-small and sparse BM25 matches. It combines the corpus rankings with reciprocal rank fusion using `k=60` by default.
+3. A first model call extracts factual tuples with source IDs and verbatim quotes. AgentSentry checks each quote against its source, sorts and deduplicates the tuples, and hashes their canonical JSON using SHA-256. Each tuple includes a hash of its source text.
+4. A separate model call decides the verdict from the claim and frozen tuples. In strict mode this call receives only the claim and frozen facts. Setting `strict_evidence_lock` to `false` also provides the original evidence to the decision call. Both modes validate the cited IDs.
+5. The audit reports `SUPPORTED`, `REFUTED`, `CONFLICTING_EVIDENCE`, or `INSUFFICIENT_EVIDENCE`. Any uncertain claim or per-claim confidence below the configured threshold flags the audit for human review. The flag is part of the response for the caller to act on.
 
----
+The model supplies the confidence scores and interprets the text. The hashes let a reviewer check the frozen representation and source contents. Semantic correctness, model calibration, and resistance to instructions embedded in documents remain model-dependent. Use corpora and request evidence you are authorized to send to the configured inference service.
 
-## 🏛️ System Architecture
+## Run locally
 
-```mermaid
-flowchart TD
-    User([User / API Request]) --> API[FastAPI Gateway]
-    API --> CacheCheck{Redis Semantic Cache}
-    
-    CacheCheck -- Hit (<15ms) --> CachedResponse[Return Cached Verdict]
-    CacheCheck -- Miss --> Orchestrator[LangGraph StateGraph DAG]
-    
-    subgraph DAG [AgentSentry Multi-Agent Orchestration]
-        Planner[Lead Planner Agent<br/>• Deconstructs query into atomic claims<br/>• Maps claim dependency graph]
-        
-        Retriever[Hybrid Retrieval Engine<br/>• Qdrant Dense BGE-M3 Embeddings<br/>• BM25 Sparse Lexical Search<br/>• Reciprocal Rank Fusion k=60]
-        
-        Verifier[Evidence-Locked Verifier<br/>• Frozen Intermediate Representation FIR<br/>• SHA-256 State Anchoring<br/>• Zero Parametric Hallucination]
-        
-        Supervisor[Supervisor & Governance Gate<br/>• Aggregates multi-claim verdicts<br/>• Evaluates SLA Confidence Threshold >= 0.85<br/>• HITL Escalation Routing]
-        
-        Planner --> Retriever
-        Retriever --> Verifier
-        Verifier -- More Claims? --> Retriever
-        Verifier -- All Claims Verified --> Supervisor
-    end
-    
-    Orchestrator --> DAG
-    Supervisor --> HITLCheck{Confidence >= 0.85?}
-    HITLCheck -- Yes --> SaveCache[Persist to Redis Cache]
-    HITLCheck -- No (Ambiguous / Conflicting) --> FlagHITL[Flag for Compliance Officer Review]
-    SaveCache --> FinalResponse([Return Audit Verdict])
-    FlagHITL --> FinalResponse
+Requires Python 3.11 or later. From the repository root in PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+uvicorn app.main:app --port 8000
 ```
 
----
+Swagger UI is available at `http://127.0.0.1:8000/docs`. By default the service runs without external connections and abstains with `INSUFFICIENT_EVIDENCE`. To enable inference, set `VLLM_API_BASE` to the OpenAI-compatible API base including `/v1`, and set `VLLM_MODEL` to the served model ID. For example, for a model already listening on port 8001:
 
-## 🔑 Core Technical Innovations
-
-### 1. Evidence-Locked Frozen Intermediate Representation (FIR)
-* **The Problem**: In standard RAG systems, providing identical evidence in different prompt order or formatting causes small models (SLMs) and even frontier LLMs to suffer a **21.2% verdict flip rate** (drifting between `SUPPORTED` and `REFUTED`).
-* **The Solution**: AgentSentry enforces a two-stage evaluation:
-  1. The retrieved evidence is decomposed into a canonical tuple intermediate representation: `(Entity, Relation, Value, Evidence_Anchor)`.
-  2. The representation is **frozen** and hashed (`SHA-256`).
-  3. The verdict is formulated strictly against the frozen representation without access to external parametric knowledge, reducing semantic drift to **< 1.5%**.
-
-### 2. Dense + Sparse Hybrid Retrieval with Reciprocal Rank Fusion (RRF)
-* Combines semantic dense retrieval (BAAI/bge-m3 1024-dim vectors) with exact keyword matching (BM25 lexical scoring).
-* Fused via Reciprocal Rank Fusion ($k=60$):
-  $$RRF\_Score(d) = \sum_{m \in M} \frac{1}{60 + r_m(d)}$$
-* Guarantees high recall for exact terminology (e.g. "AES-256-GCM", "ISO 27001 Section 4") while capturing semantic nuances.
-
-### 3. Asynchronous Multi-Agent StateGraph (LangGraph)
-* Replaces fragile chain-of-thought linear scripts with a deterministic, resilient StateGraph DAG.
-* Features dependency resolution: sub-claims are verified in topological sequence if dependencies exist.
-* Built-in retry loops and fallback policies ensure graceful degradation during external service interruptions.
-
-### 4. Enterprise LLMOps Serving & Latency Optimization
-* **Inference Serving**: Powered by **vLLM** utilizing continuous batching and PagedAttention to saturate GPU memory and reduce p99 token generation latency.
-* **Semantic Vector Cache**: Powered by **Redis**, matching repeated or semantically equivalent audit queries to deliver verified results in under **15 milliseconds**.
-* **Human-in-the-Loop (HITL) Gate**: Verifications with confidence below $0.85$ or encountering conflicting documents are automatically escalated with complete cryptographic provenance logs.
-
----
-
-## 📂 Project Structure
-
-```
-D:\AgentSentry\
-├── app\
-│   ├── __init__.py
-│   ├── main.py                     # FastAPI REST & SSE Streaming Gateway
-│   ├── config.py                   # Pydantic Settings & Environment Configuration
-│   ├── schemas\                    # Pydantic Schemas & LangGraph State Definition
-│   │   ├── __init__.py
-│   │   └── agent_state.py          # AgentState, Claim, EvidenceItem, AuditVerdict
-│   ├── services\                   # External Infrastructure Clients
-│   │   ├── __init__.py
-│   │   ├── vllm_client.py          # Async vLLM Client with PagedAttention support
-│   │   └── cache.py                # Redis Semantic & Exact Query Cache
-│   └── graph\                      # LangGraph DAG Implementation
-│       ├── __init__.py
-│       ├── workflow.py             # StateGraph Definition & Conditional Edge Routing
-│       └── nodes\
-│           ├── __init__.py
-│           ├── planner.py          # Atomic Claim Decomposition & Dependency Graph
-│           ├── retriever.py        # Qdrant Hybrid Search & Reciprocal Rank Fusion
-│           ├── verifier.py         # Evidence-Locked FIR Zero-Hallucination Engine
-│           └── supervisor.py       # Verdict Synthesis & Confidence SLA Gate
-├── evaluation\
-│   └── run_ragas_eval.py           # Automated RAGAS & VFR Benchmark Evaluation
-├── docker-compose.yml              # Multi-container orchestration (FastAPI, Qdrant, Redis)
-├── Dockerfile                      # Production container image
-├── requirements.txt                # Pinned production dependencies
-└── README.md                       # System Architecture & Documentation
+```powershell
+$env:VLLM_API_BASE = 'http://127.0.0.1:8001/v1'
+$env:VLLM_MODEL = 'my-served-model'
+uvicorn app.main:app --port 8000
 ```
 
----
+Set `VLLM_API_KEY` if the endpoint requires a key. The model must support JSON-object chat responses. The service also reads settings from a local `.env` file.
 
-## 🚀 Quickstart & Setup
+## Index a corpus
 
-### Prerequisites
-* Python 3.11+
-* Docker & Docker Compose (optional for containerized deployment)
-* Access to a vLLM endpoint or local HuggingFace weights (optional; built-in deterministic fallback included for local testing)
+Set `QDRANT_HOST` to a running Qdrant instance and `QDRANT_PORT` if it differs from 6333. `QDRANT_COLLECTION` defaults to `audit_evidence`. The indexer takes UTF-8 JSON Lines with a source name, a unique chunk number within that source, and up to 2,000 characters of text per line.
 
-### 1. Local Setup
-```bash
-# Navigate to repository
-cd D:\AgentSentry
-
-# Create and activate virtual environment
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-
-# Install dependencies
-pip install -r requirements.txt
+```json
+{"source_doc":"retention-policy.txt","chunk_id":1,"text":"Production access logs are retained for 30 days."}
 ```
 
-### 2. Running with Docker Compose
-```bash
-docker compose up -d
-```
-This spins up:
-* **FastAPI Service**: `http://localhost:8000`
-* **Qdrant Vector DB**: `http://localhost:6333`
-* **Redis Cache**: `http://localhost:6379`
-
-### 3. Launching the API Locally
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-Interactive Swagger API documentation will be available at: `http://localhost:8000/docs`.
-
-### 4. Running Benchmark Evaluation
-```bash
-python evaluation/run_ragas_eval.py
+```powershell
+$env:QDRANT_HOST = 'localhost'
+python -m app.index_corpus evidence.jsonl
 ```
 
----
+The indexer creates a compatible collection if needed and upserts by source and chunk number. FastEmbed downloads the dense and sparse model assets on first use. For a replacement snapshot, index into a fresh collection and point the API at it. When updating a collection in place, change `CORPUS_REVISION` on the API after indexing to invalidate cached verdicts.
 
-## 📡 API Endpoints
+`docker compose up --build -d` runs the API, Qdrant, and Redis. Index from the host against `localhost:6333`. Compose stores Qdrant data in the `qdrant_data` volume. If you used the earlier Compose file with `qdrant_storage/`, reindex your source chunks into the new volume. When the inference service runs on the Docker Desktop host, set `VLLM_API_BASE=http://host.docker.internal:8001/v1` for Compose and provide the served model ID. The API and Qdrant host ports bind to loopback. For a browser frontend on another origin, set `CORS_ORIGINS` to a JSON list of allowed origins. Deployments serving other users need an authenticated gateway and appropriate corpus access controls.
 
-### 1. `POST /api/v1/audit`
-Executes an end-to-end evidence-locked audit through the LangGraph StateGraph.
+## API
 
-**Request Body**:
+| Route | Result |
+| --- | --- |
+| `POST /api/v1/audit` | Complete audit response with evidence and per-claim citations |
+| `POST /api/v1/audit/stream` | Server-sent events with `start`, `node_complete`, and `done` with the full audit result, or `error` |
+| `GET /api/v1/metrics` | Process-local counts, cache hits, human-review flags, and average completed-audit latency |
+| `GET /health` | Status of the configured Redis, Qdrant collection, and inference model |
+
+Both audit routes accept the same JSON:
+
 ```json
 {
-  "query": "The payment gateway encrypts cardholder data at rest with AES-256 and holds PCI-DSS Level 1 certification.",
+  "query": "Production access logs are retained for 30 days.",
+  "context_documents": ["Production access logs are retained for 30 days."],
   "strict_evidence_lock": true
 }
 ```
 
-**Response**:
-```json
-{
-  "query": "The payment gateway encrypts cardholder data at rest with AES-256...",
-  "status": "SUPPORTED",
-  "verdict": {
-    "overall_status": "SUPPORTED",
-    "aggregated_confidence": 0.95,
-    "requires_hitl": false,
-    "audit_summary": "Audit completed across 2 decomposed propositions: 2 Supported, 0 Refuted. Calibrated confidence: 95.0%. Evidence-locked protocol verified zero ungrounded assertions.",
-    "total_latency_ms": 32.4
-  },
-  "evidence_items": [
-    {
-      "id": "chunk_a1b2c3_1",
-      "text": "Official Audit Record Section 4.2: Confirms encryption at rest using AES-256-GCM.",
-      "source_doc": "soc2_type2_audit_2024.pdf",
-      "fused_rrf_score": 0.0328
-    }
-  ],
-  "latency_ms": 32.4,
-  "cache_hit": false
-}
+Omit `context_documents` to search the configured corpus. Provide up to eight chunks of 2,000 characters each to use request-local evidence instead. An empty list explicitly supplies no evidence. Omit `strict_evidence_lock` to use `EVIDENCE_LOCKED_STRICT`, which defaults to true. `CONFIDENCE_THRESHOLD` defaults to 0.85.
+
+The service caches completed corpus audits that clear the review gate. Cache keys distinguish the query text, verification mode, model, and corpus revision. Cache hits retain source evidence and citations. Set `REDIS_URL` to share the cache across workers. Each worker has a bounded, expiring local fallback. Request-local evidence bypasses the cache.
+
+## Evaluation and tests
+
+```powershell
+python -m pip install pytest
+python -m pytest
+python -m evaluation.run_ragas_eval
 ```
 
-### 2. `POST /api/v1/audit/stream`
-Server-Sent Events (SSE) stream providing real-time updates as nodes in the DAG complete.
+The evaluation command requires a configured vLLM model. It reports verdict accuracy on four labeled fixtures, the fraction of paired verdicts that change when the same evidence is reversed, and mean verification latency. This is a small verifier benchmark. The fixture results do not measure corpus retrieval precision, RAGAS faithfulness, or production latency.
 
-### 3. `GET /api/v1/metrics`
-Observability metrics reporting total audits, cache hit rates, average latency, and HITL escalations.
+## License
 
-### 4. `GET /health`
-Subsystem health check for Qdrant, Redis, and vLLM.
-
----
-
-## 📊 Benchmark Metrics & Results
-
-| Metric | Target SLA | AgentSentry Achieved | Methodology |
-| :--- | :--- | :--- | :--- |
-| **Faithfulness** | > 95% | **97.8%** | Evaluated via RAGAS against ground-truth evidence |
-| **Verdict Flip Rate (VFR)** | < 3% | **1.2%** | Measured across semantic & ordering perturbations |
-| **Context Precision** | > 90% | **94.2%** | Dense BGE-M3 + BM25 Reciprocal Rank Fusion |
-| **Cache Hit Latency** | < 20 ms | **11.4 ms** | Redis vector/normalized key lookup |
-| **P95 Audit Latency** | < 120 ms | **84.5 ms** | Async vLLM continuous batching |
-
----
-
-## 👨‍💻 Engineering Decisions & Trade-Offs
-
-* **Why LangGraph instead of linear chains?**
-  * Linear chains break when assertions contain multiple distinct statements. A StateGraph allows conditional branching (looping over sub-claims), checkpointing, and dynamic human-in-the-loop escalation.
-* **Why Reciprocal Rank Fusion (RRF) over pure dense retrieval?**
-  * Pure semantic vector search frequently fails on exact regulatory tokens, version numbers, and compliance identifiers (e.g. "SOC 2 Type II" vs "SOC 2 Type I"). RRF fuses dense conceptual understanding with BM25 keyword precision without manual weight tuning.
-* **Why vLLM over standard Hugging Face pipeline?**
-  * vLLM's PagedAttention eliminates memory fragmentation, allowing concurrent batching across multiple agent verification calls simultaneously with up to 4x throughput.
-
----
-
-## 📄 License
-MIT License. Created by [Abhishek Raghuwanshi](https://github.com/9905abhishek-stack).
+MIT. Created by [Abhishek Raghuwanshi](https://github.com/9905abhishek-stack).

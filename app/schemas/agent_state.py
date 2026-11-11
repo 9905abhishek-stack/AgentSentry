@@ -1,10 +1,19 @@
-"""
-AgentSentry Schemas & LangGraph State Definition
-"""
-from typing import List, Dict, Optional, Annotated
+"""API and workflow models for claims, evidence, and audit results."""
+
 from enum import Enum
-from pydantic import BaseModel, Field
-import operator
+from typing import Annotated
+
+from pydantic import BaseModel, Field, StringConstraints
+
+MAX_CLAIMS = 10
+MAX_CONTEXT_CHUNKS = 8
+EvidenceText = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)
+]
+QueryText = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=5, max_length=4000)
+]
+NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 class VerdictEnum(str, Enum):
@@ -14,69 +23,81 @@ class VerdictEnum(str, Enum):
     CONFLICTING_EVIDENCE = "CONFLICTING_EVIDENCE"
 
 
-class EvidenceItem(BaseModel):
-    id: str = Field(..., description="Unique hash or ID of the evidence chunk")
-    text: str = Field(..., description="Extracted textual content of the chunk")
-    source_doc: str = Field(..., description="Origin document filename or URI")
-    chunk_id: int = Field(default=0, description="Sequential chunk index in source document")
-    dense_score: float = Field(default=0.0, description="Cosine similarity from dense embedding (BGE-M3)")
-    sparse_score: float = Field(default=0.0, description="Lexical matching score from BM25")
-    fused_rrf_score: float = Field(default=0.0, description="Combined Reciprocal Rank Fusion score")
+class EvidenceChunk(BaseModel):
+    text: EvidenceText
+    source_doc: NonBlank
+    chunk_id: int = Field(ge=0)
+
+
+class EvidenceItem(EvidenceChunk):
+    id: NonBlank
+    chunk_id: int = Field(default=0, ge=0)
+    dense_score: float = 0.0
+    sparse_score: float = 0.0
+    fused_rrf_score: float = 0.0
 
 
 class Claim(BaseModel):
-    claim_id: str = Field(..., description="Unique identifier for the sub-claim")
-    text: str = Field(..., description="Atomic verifiable statement decomposed from the input")
-    category: str = Field(default="factual", description="Category: factual, numerical, temporal, privacy")
-    dependencies: List[str] = Field(default_factory=list, description="IDs of prior claims this depends on")
+    claim_id: NonBlank
+    text: Annotated[NonBlank, Field(max_length=4000)]
+    category: str = "factual"
+    dependencies: list[NonBlank] = Field(default_factory=list, max_length=MAX_CLAIMS)
+
+
+class FrozenFact(BaseModel, frozen=True):
+    entity: NonBlank
+    relation: NonBlank
+    value: NonBlank
+    evidence_id: NonBlank
+    quote: NonBlank
+    evidence_sha256: str
 
 
 class VerificationResult(BaseModel):
-    claim_id: str = Field(..., description="Reference ID of the claim verified")
-    verdict: VerdictEnum = Field(..., description="Evidence-locked verdict outcome")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Calibrated confidence score [0.0 - 1.0]")
-    citation_ids: List[str] = Field(default_factory=list, description="IDs of supporting evidence chunks")
-    rationale: str = Field(..., description="Deterministic chain of reasoning strictly grounded in citations")
-    frozen_ir_hash: str = Field(..., description="SHA-256 hash of the frozen intermediate representation (FIR)")
+    claim_id: str
+    claim_text: str
+    verdict: VerdictEnum
+    confidence: float = Field(ge=0, le=1)
+    citation_ids: list[str] = Field(default_factory=list)
+    rationale: str
+    frozen_ir_hash: str | None = None
+    frozen_ir: tuple[FrozenFact, ...] = ()
 
 
 class AuditVerdict(BaseModel):
-    overall_status: VerdictEnum = Field(..., description="Final synthesized verdict across all claims")
-    verified_claims: List[VerificationResult] = Field(default_factory=list)
-    aggregated_confidence: float = Field(..., ge=0.0, le=1.0)
-    requires_hitl: bool = Field(default=False, description="Flag indicating if confidence fell below SLA threshold")
-    audit_summary: str = Field(..., description="Executive summary of findings with explicit citations")
-    total_latency_ms: float = Field(default=0.0)
+    overall_status: VerdictEnum
+    verified_claims: list[VerificationResult] = Field(default_factory=list)
+    aggregated_confidence: float = Field(ge=0, le=1)
+    requires_hitl: bool = False
+    audit_summary: str
+    total_latency_ms: float = 0.0
 
 
-# --- LangGraph State Definition ---
 class AgentState(BaseModel):
-    """
-    StateGraph shared state for the AgentSentry multi-agent audit DAG.
-    Uses operator.add annotations where list appending is required across nodes.
-    """
     query: str
-    claims: List[Claim] = Field(default_factory=list)
-    current_claim_index: int = 0
-    retrieved_evidence: Dict[str, List[EvidenceItem]] = Field(default_factory=dict)
-    frozen_ir_store: Dict[str, str] = Field(default_factory=dict)  # Claim ID -> Canonical FIR Text
-    verifications: List[VerificationResult] = Field(default_factory=list)
-    retry_count: int = 0
-    requires_human_review: bool = False
-    audit_verdict: Optional[AuditVerdict] = None
-    execution_log: List[str] = Field(default_factory=list)
-
-
-# --- API Request & Response Schemas ---
-class QueryRequest(BaseModel):
-    query: str = Field(..., min_length=5, description="Factual, policy, or data assertion to audit")
-    context_documents: Optional[List[str]] = Field(
-        default=None,
-        description="Optional ad-hoc reference documents to index dynamically into Qdrant for this audit"
+    strict_evidence_lock: bool = True
+    context_documents: list[EvidenceText] | None = Field(
+        default=None, max_length=MAX_CONTEXT_CHUNKS
     )
-    strict_evidence_lock: bool = Field(
-        default=True,
-        description="Enforces zero-hallucination FIR constraint; rejects ungrounded external claims"
+    claims: list[Claim] = Field(default_factory=list)
+    current_claim_index: int = 0
+    retrieved_evidence: dict[str, list[EvidenceItem]] = Field(default_factory=dict)
+    verifications: list[VerificationResult] = Field(default_factory=list)
+    requires_human_review: bool = False
+    audit_verdict: AuditVerdict | None = None
+    execution_log: list[str] = Field(default_factory=list)
+
+
+class QueryRequest(BaseModel):
+    query: QueryText
+    context_documents: list[EvidenceText] | None = Field(
+        default=None,
+        max_length=MAX_CONTEXT_CHUNKS,
+        description="Evidence chunks supplied for this request in place of the configured corpus.",
+    )
+    strict_evidence_lock: bool | None = Field(
+        default=None,
+        description="Restrict the decision prompt to frozen facts. Defaults to the server setting.",
     )
 
 
@@ -84,6 +105,6 @@ class AuditResponse(BaseModel):
     query: str
     status: VerdictEnum
     verdict: AuditVerdict
-    evidence_items: List[EvidenceItem]
+    evidence_items: list[EvidenceItem]
     latency_ms: float
     cache_hit: bool = False

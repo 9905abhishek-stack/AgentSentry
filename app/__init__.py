@@ -1,5 +1,3 @@
-"""
-AgentSentry: Enterprise Evidence-Locked Multi-Agent Audit System
-Built with LangGraph DAG, Qdrant Hybrid Retrieval, and vLLM Serving.
-"""
+"""AgentSentry evidence-grounded audit service."""
+
 __version__ = "0.1.0"

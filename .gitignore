@@ -38,6 +38,9 @@ dump.rdb
 # Evaluation results & cache
 eval_results/
 .ragas_cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # IDE & Editor
 .vscode/
