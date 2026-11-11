@@ -1,7 +1,9 @@
 import asyncio
 import hashlib
 import json
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from types import SimpleNamespace
 from typing import Any
@@ -10,6 +12,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from qdrant_client import QdrantClient, models
+from qdrant_client.http.models import QueryResponse
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from app import main
@@ -585,3 +588,303 @@ def test_vllm_rejects_content_filtered_completions() -> None:
                 await service.generate([{"role": "user", "content": QUERY}])
 
     asyncio.run(exercise())
+
+
+def test_corpus_pool_concurrent_searches_and_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.closed = False
+
+        def query_batch_points(
+            self, _collection: str, _requests: list[models.QueryRequest]
+        ) -> tuple[QueryResponse, QueryResponse]:
+            self.entered.set()
+            assert self.release.wait(timeout=10.0), "Timed out waiting for release"
+            response = QueryResponse(
+                points=[
+                    models.ScoredPoint(
+                        id="p1",
+                        version=0,
+                        score=0.9,
+                        payload={
+                            "source_doc": "doc.txt",
+                            "chunk_id": 1,
+                            "text": "evidence text",
+                        },
+                        vector=None,
+                    )
+                ]
+            )
+            return response, response
+
+        def close(self) -> None:
+            self.closed = True
+
+    pool = retriever.CorpusPool()
+    monkeypatch.setattr(retriever, "_corpus_pool", pool)
+    client1, client2, client3 = FakeClient(), FakeClient(), FakeClient()
+    clients = iter((client1, client2, client3))
+    monkeypatch.setattr(retriever, "connect_corpus", lambda: next(clients))
+    queued = threading.Event()
+    queued_thread: threading.Thread | None = None
+    wait = pool._condition.wait
+
+    def watch_wait(timeout: float | None = None) -> bool:
+        if threading.current_thread() is queued_thread:
+            queued.set()
+        return wait(timeout)
+
+    def queued_search() -> list[EvidenceItem]:
+        nonlocal queued_thread
+        queued_thread = threading.current_thread()
+        return retriever.search_corpus("queued query")
+
+    monkeypatch.setattr(pool._condition, "wait", watch_wait)
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        first = workers.submit(retriever.search_corpus, "query one")
+        second = workers.submit(retriever.search_corpus, "query two")
+        try:
+            assert client1.entered.wait(timeout=2)
+            assert client2.entered.wait(timeout=2)
+            pending = workers.submit(queued_search)
+            assert queued.wait(timeout=2)
+            shutdown = workers.submit(retriever.close_corpus)
+            with pytest.raises(RuntimeError, match="shutting down"):
+                pending.result(timeout=2)
+            assert not client1.closed and not client2.closed
+        finally:
+            client1.release.set()
+            client2.release.set()
+
+        assert len(first.result(timeout=2)) == len(second.result(timeout=2)) == 1
+        shutdown.result(timeout=2)
+
+    assert client1.closed and client2.closed
+    client3.release.set()
+    assert len(retriever.search_corpus("next lifespan")) == 1
+    assert client3.entered.is_set()
+    retriever.close_corpus()
+    assert client3.closed
+
+
+def test_distinct_active_models_produce_distinct_cache_outcomes(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = EvidenceItem(id="corpus-1", source_doc="policy.txt", text=EVIDENCE)
+    monkeypatch.setattr(settings, "qdrant_host", "unused.test")
+    monkeypatch.setattr(vllm_service, "base_url", "http://unused.test/v1")
+    monkeypatch.setattr(retriever, "search_corpus", lambda _query: [evidence])
+    calls = install_model(
+        monkeypatch, extraction=[fact("corpus-1")], citation="corpus-1"
+    )
+
+    # 1. Audit with model-a
+    monkeypatch.setattr(vllm_service, "model", "model-a")
+    res1 = client.post("/api/v1/audit", json={"query": QUERY}).json()
+    assert not res1["cache_hit"]
+    assert len(calls) == 3
+
+    # 2. Second audit with model-a hits the cache
+    res2 = client.post("/api/v1/audit", json={"query": QUERY}).json()
+    assert res2["cache_hit"]
+    assert len(calls) == 3
+
+    # 3. Audit with model-b on the same query/corpus produces a cache miss
+    monkeypatch.setattr(vllm_service, "model", "model-b")
+    res3 = client.post("/api/v1/audit", json={"query": QUERY}).json()
+    assert not res3["cache_hit"]
+    assert len(calls) == 6
+
+    # 4. Second audit with model-b hits the cache
+    res4 = client.post("/api/v1/audit", json={"query": QUERY}).json()
+    assert res4["cache_hit"]
+    assert len(calls) == 6
+
+    # 5. Switching back to model-a hits the model-a cached entry
+    monkeypatch.setattr(vllm_service, "model", "model-a")
+    res5 = client.post("/api/v1/audit", json={"query": QUERY}).json()
+    assert res5["cache_hit"]
+    assert len(calls) == 6
+
+    # 6. Verify key generation includes active model and v4 prefix
+    key_a = cache_module.cache_service.key(
+        QUERY, True, vllm_api_base="http://unused.test/v1", vllm_model="model-a"
+    )
+    key_b = cache_module.cache_service.key(
+        QUERY, True, vllm_api_base="http://unused.test/v1", vllm_model="model-b"
+    )
+    assert key_a != key_b
+    assert key_a.startswith("agentsentry:audit:v4:")
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_original_assertion_payload_strict_and_relaxed(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, strict: bool
+) -> None:
+    original = "Production logs are stored in US and retained for 30 days."
+    c1 = "Production logs are stored in US."
+    c2 = "Production logs are retained for 30 days."
+
+    chunk_anchored = "Production logs are stored in US data centers."
+    chunk_unanchored = "Access to the data center is monitored 24/7."
+
+    assertion_payloads: list[dict[str, Any]] = []
+
+    async def generate(messages: list[dict[str, str]]) -> str:
+        prompt, user = (item["content"] for item in messages)
+        if prompt.startswith("Decompose"):
+            return json.dumps(
+                {
+                    "claims": [
+                        {"claim_id": "c1", "text": c1},
+                        {"claim_id": "c2", "text": c2},
+                    ]
+                }
+            )
+        payload = json.loads(user)
+        if prompt.startswith(verifier.EXTRACTION_PROMPT):
+            if payload["claim"] == c1:
+                return json.dumps(
+                    {
+                        "facts": [
+                            {
+                                "entity": "production logs",
+                                "relation": "storage location",
+                                "value": "US data centers",
+                                "evidence_id": "context-1",
+                                "quote": chunk_anchored,
+                            }
+                        ]
+                    }
+                )
+            return json.dumps({"facts": []})
+
+        assert prompt.startswith(verifier.DECISION_PROMPT)
+        if payload["claim"] == original:
+            assertion_payloads.append(payload)
+            return json.dumps(
+                {
+                    "verdict": "SUPPORTED",
+                    "confidence": 0.95,
+                    "citation_ids": ["context-1"],
+                    "rationale": "Decided against supplied facts and evidence.",
+                }
+            )
+
+        is_c1 = payload["claim"] == c1
+        return json.dumps(
+            {
+                "verdict": "SUPPORTED" if is_c1 else "INSUFFICIENT_EVIDENCE",
+                "confidence": 0.95 if is_c1 else 0.0,
+                "citation_ids": ["context-1"] if is_c1 else [],
+                "rationale": "Claim decision.",
+            }
+        )
+
+    monkeypatch.setattr(vllm_service, "generate", generate)
+
+    result = client.post(
+        "/api/v1/audit",
+        json={
+            "query": original,
+            "context_documents": [chunk_anchored, chunk_unanchored],
+            "strict_evidence_lock": strict,
+        },
+    ).json()
+
+    assert len(assertion_payloads) == 1
+    assertion_payload = assertion_payloads[0]
+
+    assert assertion_payload["claim"] == original
+    assert len(assertion_payload["frozen_facts"]) == 1
+    assert assertion_payload["frozen_facts"][0]["evidence_id"] == "context-1"
+
+    if strict:
+        assert "evidence" not in assertion_payload
+    else:
+        assert "evidence" in assertion_payload
+        evidence_ids = [item["id"] for item in assertion_payload["evidence"]]
+        assert evidence_ids == ["context-1", "context-2"]
+
+    assert result["status"] == "SUPPORTED"
+    assert result["verdict"]["assertion_verification"]["citation_ids"] == ["context-1"]
+
+
+def test_original_assertion_relaxed_mode_rejects_unanchored_citation(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = "Production logs are stored in US and retained for 30 days."
+    c1 = "Production logs are stored in US."
+    c2 = "Production logs are retained for 30 days."
+    chunk_anchored = "Production logs are stored in US data centers."
+    chunk_unanchored = "Access to the data center is monitored 24/7."
+
+    async def generate(messages: list[dict[str, str]]) -> str:
+        prompt, user = (item["content"] for item in messages)
+        if prompt.startswith("Decompose"):
+            return json.dumps(
+                {
+                    "claims": [
+                        {"claim_id": "c1", "text": c1},
+                        {"claim_id": "c2", "text": c2},
+                    ]
+                }
+            )
+        payload = json.loads(user)
+        if prompt.startswith(verifier.EXTRACTION_PROMPT):
+            if payload["claim"] == c1:
+                return json.dumps(
+                    {
+                        "facts": [
+                            {
+                                "entity": "production logs",
+                                "relation": "storage location",
+                                "value": "US data centers",
+                                "evidence_id": "context-1",
+                                "quote": chunk_anchored,
+                            }
+                        ]
+                    }
+                )
+            return json.dumps({"facts": []})
+
+        assert prompt.startswith(verifier.DECISION_PROMPT)
+        if payload["claim"] == original:
+            return json.dumps(
+                {
+                    "verdict": "SUPPORTED",
+                    "confidence": 0.95,
+                    "citation_ids": ["context-2"],
+                    "rationale": "Attempting to cite unanchored chunk.",
+                }
+            )
+
+        is_c1 = payload["claim"] == c1
+        return json.dumps(
+            {
+                "verdict": "SUPPORTED" if is_c1 else "INSUFFICIENT_EVIDENCE",
+                "confidence": 0.95 if is_c1 else 0.0,
+                "citation_ids": ["context-1"] if is_c1 else [],
+                "rationale": "Claim decision.",
+            }
+        )
+
+    monkeypatch.setattr(vllm_service, "generate", generate)
+
+    result = client.post(
+        "/api/v1/audit",
+        json={
+            "query": original,
+            "context_documents": [chunk_anchored, chunk_unanchored],
+            "strict_evidence_lock": False,
+        },
+    ).json()
+
+    assertion = result["verdict"]["assertion_verification"]
+    assert assertion["verdict"] == "INSUFFICIENT_EVIDENCE"
+    assert assertion["issue"] == "INVALID_MODEL_OUTPUT"
+    assert assertion["citation_ids"] == []

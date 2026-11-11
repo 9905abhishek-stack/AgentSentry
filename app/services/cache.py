@@ -35,7 +35,14 @@ class CacheService:
                 logger.warning("Redis configuration is invalid. Using the local cache.")
 
     @staticmethod
-    def key(query: str, strict: bool) -> str:
+    def key(
+        query: str,
+        strict: bool,
+        vllm_api_base: str | None = None,
+        vllm_model: str | None = None,
+    ) -> str:
+        api_base = settings.vllm_api_base if vllm_api_base is None else vllm_api_base
+        model = settings.vllm_model if vllm_model is None else vllm_model
         components = [
             query,
             strict,
@@ -44,14 +51,14 @@ class CacheService:
             settings.qdrant_collection,
             settings.corpus_revision,
             settings.hybrid_rrf_k,
-            settings.vllm_api_base,
-            settings.vllm_model,
+            api_base,
+            model,
             settings.llm_max_tokens,
             settings.max_verification_retries,
             settings.confidence_threshold,
         ]
         digest = hashlib.sha256(json.dumps(components).encode("utf-8")).hexdigest()
-        return f"agentsentry:audit:v3:{digest}"
+        return f"agentsentry:audit:v4:{digest}"
 
     async def get(self, key: str) -> AuditResponse | None:
         if self._redis is not None:

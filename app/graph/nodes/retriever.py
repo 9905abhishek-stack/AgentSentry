@@ -3,7 +3,9 @@
 import asyncio
 import hashlib
 import logging
-from threading import Lock
+from collections.abc import Iterator
+from contextlib import contextmanager
+from threading import Condition
 from typing import Any
 
 from qdrant_client import QdrantClient, models
@@ -25,16 +27,71 @@ from app.services.corpus import (
 )
 
 logger = logging.getLogger(__name__)
-_corpus_client: QdrantClient | None = None
-_corpus_lock = Lock()
+
+CORPUS_POOL_SIZE = 2
+
+
+class CorpusPool:
+    def __init__(self) -> None:
+        self._condition = Condition()
+        self._idle: list[QdrantClient] = []
+        self._leased = 0
+        self._closing = False
+        self._generation = 0
+
+    @contextmanager
+    def lease(self) -> Iterator[QdrantClient]:
+        with self._condition:
+            generation = self._generation
+            self._condition.wait_for(
+                lambda: (
+                    self._closing
+                    or generation != self._generation
+                    or bool(self._idle)
+                    or self._leased < CORPUS_POOL_SIZE
+                )
+            )
+            if self._closing or generation != self._generation:
+                raise RuntimeError("Corpus client pool is shutting down.")
+            client = self._idle.pop() if self._idle else connect_corpus()
+            self._leased += 1
+
+        try:
+            yield client
+        finally:
+            with self._condition:
+                self._leased -= 1
+                self._idle.append(client)
+                self._condition.notify_all()
+
+    def close(self) -> None:
+        with self._condition:
+            if self._closing:
+                self._condition.wait_for(lambda: not self._closing)
+                return
+            self._closing = True
+            self._generation += 1
+            self._condition.notify_all()
+            self._condition.wait_for(lambda: self._leased == 0)
+            clients_to_close, self._idle = self._idle, []
+
+        try:
+            for client in clients_to_close:
+                try:
+                    client.close()
+                except Exception:
+                    logger.warning("Error closing corpus client", exc_info=True)
+        finally:
+            with self._condition:
+                self._closing = False
+                self._condition.notify_all()
+
+
+_corpus_pool = CorpusPool()
 
 
 def close_corpus() -> None:
-    global _corpus_client
-    with _corpus_lock:
-        if _corpus_client is not None:
-            _corpus_client.close()
-            _corpus_client = None
+    _corpus_pool.close()
 
 
 def compute_rrf(
@@ -67,7 +124,6 @@ def compute_rrf(
 
 
 def search_corpus(text: str) -> list[EvidenceItem]:
-    global _corpus_client
     requests = [
         models.QueryRequest(
             query=models.Document(text=text, model=model),
@@ -81,12 +137,8 @@ def search_corpus(text: str) -> list[EvidenceItem]:
         )
     ]
     # The client lazily loads its embedding models on first use.
-    with _corpus_lock:
-        if _corpus_client is None:
-            _corpus_client = connect_corpus()
-        dense, sparse = _corpus_client.query_batch_points(
-            settings.qdrant_collection, requests
-        )
+    with _corpus_pool.lease() as client:
+        dense, sparse = client.query_batch_points(settings.qdrant_collection, requests)
 
     def to_evidence(
         points: list[models.ScoredPoint], score_field: str

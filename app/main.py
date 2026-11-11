@@ -140,7 +140,12 @@ async def run_audit(
         and settings.qdrant_host
         and vllm_service.base_url
     ):
-        key = cache_service.key(request.query, strict)
+        key = cache_service.key(
+            request.query,
+            strict,
+            vllm_api_base=vllm_service.base_url,
+            vllm_model=vllm_service.model,
+        )
         response = await cache_service.get(key)
 
     if response is None:

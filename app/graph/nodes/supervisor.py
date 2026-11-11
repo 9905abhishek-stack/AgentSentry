@@ -26,16 +26,20 @@ async def supervise_and_synthesize(state: AgentState) -> dict[str, Any]:
             facts, digest = canonicalize_facts(
                 [fact for result in state.verifications for fact in result.frozen_ir]
             )
-            anchored_ids = {fact.evidence_id for fact in facts}
-            evidence = {
-                item.id: item
-                for items in state.retrieved_evidence.values()
-                for item in items
-                if item.id in anchored_ids
-            }
+            evidence = (
+                []
+                if state.strict_evidence_lock
+                else list(
+                    {
+                        item.id: item
+                        for items in state.retrieved_evidence.values()
+                        for item in items
+                    }.values()
+                )
+            )
             assertion_verification = await decide_claim(
                 Claim(claim_id="assertion", text=state.query),
-                list(evidence.values()),
+                evidence,
                 facts,
                 digest,
                 state.strict_evidence_lock,
