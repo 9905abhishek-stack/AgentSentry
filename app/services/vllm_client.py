@@ -70,11 +70,12 @@ class VLLMClient:
         
         # Deconstruct / Planner mock
         if "decompose" in content or "atomic verifiable claims" in content:
+            query_text = content.split("claims:")[-1].strip().strip("'\"") if "claims:" in content else "Primary audited assertion"
             return json.dumps({
                 "claims": [
                     {
                         "claim_id": "c1",
-                        "text": "The primary assertion extracted from input context.",
+                        "text": query_text,
                         "category": "factual",
                         "dependencies": []
                     }
