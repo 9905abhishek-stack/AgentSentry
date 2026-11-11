@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  # AgentSentry Core FastAPI Service
+  agentsentry-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agentsentry_api
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=production
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - REDIS_URL=redis://redis:6379/0
+      - VLLM_API_BASE=http://vllm:8000/v1
+      - VLLM_MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct
+    depends_on:
+      - qdrant
+      - redis
+    restart: unless-stopped
+
+  # Qdrant Vector Search Engine (Dense + Sparse Hybrid)
+  qdrant:
+    image: qdrant/qdrant:v1.8.4
+    container_name: agentsentry_qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+
+  # Redis Semantic Cache & State Store
+  redis:
+    image: redis:7.2-alpine
+    container_name: agentsentry_redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  # vLLM Serving Engine (Optional: run with GPU support)
+  # vllm:
+  #   image: vllm/vllm-openai:latest
+  #   container_name: agentsentry_vllm
+  #   runtime: nvidia
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   environment:
+  #     - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+  #   command: --model meta-llama/Meta-Llama-3.1-8B-Instruct --gpu-memory-utilization 0.90 --max-model-len 8192 --port 8000
+  #   ports:
+  #     - "8001:8000"
